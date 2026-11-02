@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站下载助手（BiliDrown）
 // @namespace    https://github.com/Exsshly
-// @version      0.0.5
+// @version      0.0.6
 // @description  该脚本由B站解析助手拓展改造，作为其油猴替代版，支持视频音频合并下载、仅下载音频以及提取封面。首次下载需要加载ffmpeg核心模块，后续会被浏览器缓存以加快下载速度。请在视频页面等待解析完成后再进行下载，解析过程中请勿刷新页面或切换视频，以免导致解析失败。解析失败时可以尝试多点击几次下载按钮，或刷新页面重试。如果持续无法解析，请检查控制台是否有相关错误日志，并反馈给开发者以便修复。该脚本仅供学习和研究使用，请勿用于任何商业用途或侵犯版权的行为。
 // @author       Exsshly
 // @copyright     2026, Exsshly (https://github.com/Exsshly)
@@ -23,12 +23,7 @@
 // @connect      i4.hdslb.com
 // @connect      *.hdslb.com
 // @connect      unpkg.com
-// @require      https://unpkg.com/@ffmpeg/ffmpeg@0.12.15/dist/umd/ffmpeg.min.js
-// @require      https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd/core.min.js
-// @require      https://unpkg.com/@ffmpeg/core-mt@0.12.10/dist/umd/core-mt.min.js
 // @noframes
-// @downloadURL https://update.greasyfork.org/scripts/578205/B%E7%AB%99%E4%B8%8B%E8%BD%BD%E5%8A%A9%E6%89%8B%EF%BC%88BiliDrown%EF%BC%89.user.js
-// @updateURL https://update.greasyfork.org/scripts/578205/B%E7%AB%99%E4%B8%8B%E8%BD%BD%E5%8A%A9%E6%89%8B%EF%BC%88BiliDrown%EF%BC%89.meta.js
 // ==/UserScript==
 
 (() => {
@@ -39,12 +34,16 @@
   const HOST_ID = 'bilibili-helper-host';
   const PLAYURL_API = '//api.bilibili.com/x/player/wbi/playurl';
   const PANEL_COLLAPSED_STORAGE_KEY = 'bilibili-helper-tm-panel-collapsed';
-  const FFMPEG_VERSION = '0.12.15';
-  const FFMPEG_CORE_VERSION = '0.12.10';
-  const FFMPEG_MT_CORE_VERSION = '0.12.10';
+  // 与原 CRX 使用的 ffmpeg 0.12.1 对齐，保证封装命令和输出行为一致。
+  const FFMPEG_VERSION = '0.12.1';
+  const FFMPEG_CORE_VERSION = '0.12.1';
+  const FFMPEG_MT_CORE_VERSION = '0.12.1';
   const FFMPEG_BASE_URL = `https://unpkg.com/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/umd`;
   const FFMPEG_CORE_BASE_URL = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
   const FFMPEG_MT_CORE_BASE_URL = `https://unpkg.com/@ffmpeg/core-mt@${FFMPEG_MT_CORE_VERSION}/dist/umd`;
+  const FFMPEG_CACHE_DB_NAME = 'biliDrown-ffmpeg-cache';
+  const FFMPEG_CACHE_STORE_NAME = 'assets';
+  const FFMPEG_CACHE_SCHEMA_VERSION = 1;
 
   const QUALITY_LABELS = {
     16: '360P 流畅',
@@ -74,6 +73,7 @@
     ffmpegWasmUrl: '',
     ffmpegWorkerLoadUrl: '',
     ffmpegModuleCleanupBound: false,
+    ffmpegCacheDbPromise: null,
   };
 
   if (location.href.includes('bilibili.com/s/video/')) {
@@ -277,7 +277,7 @@
       }
       #${PANEL_ID} {
         position: fixed;
-        right: 16px;
+        left: 16px;
         bottom: 16px;
         width: min(420px, calc(100vw - 32px));
         max-height: min(62vh, 760px);
@@ -773,6 +773,89 @@
     };
   }
 
+  function getPlayerSelectedQuality() {
+    const activeQuality = document.querySelector('.squirtle-quality-select-list li.active, .bpx-player-ctrl-quality-menu .bpx-state-active');
+    let quality = Number(activeQuality?.dataset?.value || 0);
+    if (quality === 0 && activeQuality?.parentElement) {
+      quality = Number(activeQuality.parentElement.querySelector('li:first-child')?.dataset?.value || 0);
+    }
+    if (Number.isFinite(quality) && quality > 0) {
+      return quality;
+    }
+
+    try {
+      const settings = JSON.parse(localStorage.bilibili_player_settings || '{}');
+      const defaultQuality = Number(settings?.setting_config?.defquality || 120);
+      if (Number.isFinite(defaultQuality) && defaultQuality > 0) {
+        return defaultQuality;
+      }
+    } catch (_) {
+      // 使用下面的默认值。
+    }
+    return 120;
+  }
+
+  function getCrxCompatibleVideoTitle(fallbackTitle) {
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const videoData = pageWindow.__INITIAL_STATE__?.videoData || {};
+    const title = videoData.title || fallbackTitle;
+    const pages = Array.isArray(videoData.pages) ? videoData.pages : [];
+    if (pages.length <= 1) {
+      return title;
+    }
+
+    const requestedPage = Number(new URL(location.href).searchParams.get('p') || 1);
+    const currentPage = pages.find(page => Number(page?.page) === requestedPage) || pages[0];
+    if (!currentPage?.page || !currentPage?.part) {
+      return title;
+    }
+    return `${title}_P${currentPage.page}_${currentPage.part}`;
+  }
+
+  async function refreshVideoPayloadForDownload(fallbackPayload) {
+    const identity = getCurrentPageIdentity();
+    if (identity.type !== 'video' || !identity.cid || (!identity.avid && !identity.bvid)) {
+      return fallbackPayload;
+    }
+
+    const requestUrl = new URL(PLAYURL_API, location.origin);
+    requestUrl.searchParams.set('qn', String(getPlayerSelectedQuality()));
+    requestUrl.searchParams.set('fnver', '0');
+    requestUrl.searchParams.set('fnval', '4048');
+    requestUrl.searchParams.set('fourk', '1');
+    requestUrl.searchParams.set('cid', identity.cid);
+    if (identity.avid) {
+      requestUrl.searchParams.set('avid', identity.avid);
+    }
+    if (identity.bvid) {
+      requestUrl.searchParams.set('bvid', identity.bvid);
+    }
+
+    try {
+      const response = await fetch(requestUrl.href, { credentials: 'include' });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const rawPayload = await response.json();
+      if (rawPayload?.code && rawPayload.code !== 0) {
+        throw new Error(rawPayload.message || `接口返回 ${rawPayload.code}`);
+      }
+
+      const refreshedPayload = normalizePayload(rawPayload, requestUrl.href, state.currentPageKey);
+      if (!refreshedPayload.dash && !refreshedPayload.durl) {
+        throw new Error('playurl 响应中没有可下载的媒体流');
+      }
+      refreshedPayload.title = getCrxCompatibleVideoTitle(refreshedPayload.title);
+      state.currentPayloadKey = refreshedPayload.pageKey;
+      state.currentPayload = refreshedPayload;
+      return refreshedPayload;
+    } catch (error) {
+      // 原扩展在请求失败时也保留播放器已有的 playurl 数据；这里同样回退，避免短时网络问题中断下载。
+      console.warn('[B站下载助手] 无法按当前清晰度刷新 playurl，使用播放器已解析的资源：', error);
+      return fallbackPayload;
+    }
+  }
+
   function isMatchingPlayurlRequest(requestUrl) {
     const requestParams = new URL(requestUrl, location.href).searchParams;
     const pageIdentity = getCurrentPageIdentity();
@@ -1147,6 +1230,81 @@
     return urls;
   }
 
+  function getFfmpegCacheDb() {
+    if (!state.ffmpegCacheDbPromise) {
+      state.ffmpegCacheDbPromise = new Promise((resolve, reject) => {
+        if (!window.indexedDB) {
+          reject(new Error('当前浏览器不支持 IndexedDB'));
+          return;
+        }
+        const request = window.indexedDB.open(FFMPEG_CACHE_DB_NAME, FFMPEG_CACHE_SCHEMA_VERSION);
+        request.onupgradeneeded = () => {
+          const database = request.result;
+          if (!database.objectStoreNames.contains(FFMPEG_CACHE_STORE_NAME)) {
+            database.createObjectStore(FFMPEG_CACHE_STORE_NAME, { keyPath: 'key' });
+          }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('无法打开 ffmpeg 缓存'));
+      });
+    }
+    return state.ffmpegCacheDbPromise;
+  }
+
+  async function readFfmpegCache(key, type) {
+    const database = await getFfmpegCacheDb();
+    return await new Promise((resolve, reject) => {
+      const request = database.transaction(FFMPEG_CACHE_STORE_NAME, 'readonly').objectStore(FFMPEG_CACHE_STORE_NAME).get(key);
+      request.onsuccess = () => {
+        const entry = request.result;
+        resolve(entry?.type === type ? entry.value : null);
+      };
+      request.onerror = () => reject(request.error || new Error('读取 ffmpeg 缓存失败'));
+    });
+  }
+
+  async function writeFfmpegCache(key, type, value) {
+    const database = await getFfmpegCacheDb();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(FFMPEG_CACHE_STORE_NAME, 'readwrite');
+      transaction.objectStore(FFMPEG_CACHE_STORE_NAME).put({
+        key,
+        type,
+        value,
+        cachedAt: Date.now(),
+      });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error || new Error('写入 ffmpeg 缓存失败'));
+      transaction.onabort = () => reject(transaction.error || new Error('写入 ffmpeg 缓存被取消'));
+    });
+  }
+
+  async function loadCachedFfmpegAsset(cacheKey, sourceUrl, type) {
+    try {
+      const cached = await readFfmpegCache(cacheKey, type);
+      if (type === 'text' && typeof cached === 'string' && cached.length > 0) {
+        console.log('[B站下载助手] 已从持久缓存加载 ffmpeg 资源:', cacheKey);
+        return cached;
+      }
+      if (type === 'binary' && cached instanceof ArrayBuffer && cached.byteLength > 0) {
+        console.log('[B站下载助手] 已从持久缓存加载 ffmpeg 资源:', cacheKey);
+        return cached;
+      }
+    } catch (error) {
+      // 缓存不可用不应阻止下载；仍可依赖网络及浏览器 HTTP 缓存。
+      console.warn('[B站下载助手] 读取 ffmpeg 持久缓存失败，将从网络加载：', error);
+    }
+
+    const asset = type === 'binary' ? await loadRemoteBinary(sourceUrl) : await loadRemoteText(sourceUrl);
+    try {
+      await writeFfmpegCache(cacheKey, type, asset);
+      console.log('[B站下载助手] 已持久化缓存 ffmpeg 资源:', cacheKey);
+    } catch (error) {
+      console.warn('[B站下载助手] 无法持久化 ffmpeg 资源，将仅使用本次加载结果：', error);
+    }
+    return asset;
+  }
+
   async function loadRemoteText(sourceUrl) {
     if (typeof GM_xmlhttpRequest === 'function') {
       return await new Promise((resolve, reject) => {
@@ -1214,11 +1372,10 @@
     return await response.arrayBuffer();
   }
 
-  async function toBlobURL(sourceUrl, mimeType) {
+  async function toBlobURL(cacheKey, sourceUrl, mimeType) {
     const isBinary = mimeType === 'application/wasm';
-    const blob = isBinary
-      ? new Blob([await loadRemoteBinary(sourceUrl)], { type: mimeType })
-      : new Blob([await loadRemoteText(sourceUrl)], { type: mimeType });
+    const asset = await loadCachedFfmpegAsset(cacheKey, sourceUrl, isBinary ? 'binary' : 'text');
+    const blob = new Blob([asset], { type: mimeType });
     return URL.createObjectURL(blob);
   }
 
@@ -1228,7 +1385,7 @@
       return pageWindow.FFmpegWASM;
     }
 
-    const source = await loadRemoteText(`${FFMPEG_BASE_URL}/ffmpeg.js`);
+    const source = await loadCachedFfmpegAsset(`ffmpeg-${FFMPEG_VERSION}-module`, `${FFMPEG_BASE_URL}/ffmpeg.js`, 'text');
     const patchedSource = source.replace('new URL(e.p+e.u(814),e.b)', 'r.workerLoadURL');
     const moduleUrl = URL.createObjectURL(new Blob([patchedSource], { type: 'text/javascript' }));
     state.ffmpegModuleUrl = moduleUrl;
@@ -1279,15 +1436,16 @@
 
         const baseFFmpegUrl = FFMPEG_BASE_URL;
         const coreBaseUrl = window.crossOriginIsolated ? FFMPEG_MT_CORE_BASE_URL : FFMPEG_CORE_BASE_URL;
-        const coreUrl = await toBlobURL(`${coreBaseUrl}/ffmpeg-core.js`, 'text/javascript');
-        const wasmUrl = await toBlobURL(`${coreBaseUrl}/ffmpeg-core.wasm`, 'application/wasm');
-        const workerLoadUrl = await toBlobURL(`${baseFFmpegUrl}/814.ffmpeg.js`, 'text/javascript');
+        const coreFlavor = window.crossOriginIsolated ? 'mt' : 'single';
+        const coreUrl = await toBlobURL(`ffmpeg-${FFMPEG_CORE_VERSION}-${coreFlavor}-core-js`, `${coreBaseUrl}/ffmpeg-core.js`, 'text/javascript');
+        const wasmUrl = await toBlobURL(`ffmpeg-${FFMPEG_CORE_VERSION}-${coreFlavor}-core-wasm`, `${coreBaseUrl}/ffmpeg-core.wasm`, 'application/wasm');
+        const workerLoadUrl = await toBlobURL(`ffmpeg-${FFMPEG_VERSION}-worker-loader`, `${baseFFmpegUrl}/814.ffmpeg.js`, 'text/javascript');
         state.ffmpegCoreUrl = coreUrl;
         state.ffmpegWasmUrl = wasmUrl;
         state.ffmpegWorkerLoadUrl = workerLoadUrl;
 
         if (window.crossOriginIsolated) {
-          const workerUrl = await toBlobURL(`${coreBaseUrl}/ffmpeg-core.worker.js`, 'text/javascript');
+          const workerUrl = await toBlobURL(`ffmpeg-${FFMPEG_CORE_VERSION}-${coreFlavor}-core-worker`, `${coreBaseUrl}/ffmpeg-core.worker.js`, 'text/javascript');
           state.ffmpegWorkerUrl = workerUrl;
           await ffmpeg.load({
             coreURL: coreUrl,
@@ -1375,7 +1533,7 @@
   }
 
   async function startCurrentDownload(button, action) {
-    const payload = state.currentPayload;
+    let payload = state.currentPayload;
     if (!payload) {
       setStatus('没有可下载的 playurl 数据');
       return;
@@ -1385,6 +1543,13 @@
       state.currentPayloadKey = '';
       setStatus('当前页面的资源已过期，请重新等待解析');
       return;
+    }
+
+    // 投稿视频与原 CRX 一样，在下载前按播放器当前清晰度重新请求 playurl；
+    // 番剧继续沿用播放器的已授权响应，避免越过其不同的播放授权路径。
+    if (action !== 'download-cover') {
+      setStatus('正在确认当前清晰度的下载资源...');
+      payload = await refreshVideoPayloadForDownload(payload);
     }
 
     const taskId = ++state.activeTaskId;
