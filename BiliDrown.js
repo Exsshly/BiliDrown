@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站下载助手（BiliDrown）
 // @namespace    https://github.com/Exsshly
-// @version      0.0.6
+// @version      0.0.7
 // @description  该脚本由B站解析助手拓展改造，作为其油猴替代版，支持视频音频合并下载、仅下载音频以及提取封面。首次下载需要加载ffmpeg核心模块，后续会被浏览器缓存以加快下载速度。请在视频页面等待解析完成后再进行下载，解析过程中请勿刷新页面或切换视频，以免导致解析失败。解析失败时可以尝试多点击几次下载按钮，或刷新页面重试。如果持续无法解析，请检查控制台是否有相关错误日志，并反馈给开发者以便修复。该脚本仅供学习和研究使用，请勿用于任何商业用途或侵犯版权的行为。
 // @author       Exsshly
 // @copyright     2026, Exsshly (https://github.com/Exsshly)
@@ -34,6 +34,7 @@
   const HOST_ID = 'bilibili-helper-host';
   const PLAYURL_API = '//api.bilibili.com/x/player/wbi/playurl';
   const PANEL_COLLAPSED_STORAGE_KEY = 'bilibili-helper-tm-panel-collapsed';
+  const PANEL_POSITION_STORAGE_KEY = 'bilibili-helper-tm-panel-position';
   // 与原 CRX 使用的 ffmpeg 0.12.1 对齐，保证封装命令和输出行为一致。
   const FFMPEG_VERSION = '0.12.1';
   const FFMPEG_CORE_VERSION = '0.12.1';
@@ -74,6 +75,10 @@
     ffmpegWorkerLoadUrl: '',
     ffmpegModuleCleanupBound: false,
     ffmpegCacheDbPromise: null,
+    bangumiQualityObserver: null,
+    bangumiQualityTarget: null,
+    bangumiQualityRetryTimer: 0,
+    bangumiQualityRefreshTimer: 0,
   };
 
   if (location.href.includes('bilibili.com/s/video/')) {
@@ -216,6 +221,7 @@
     ensureMarker();
     ensureBaseStyles();
     ensurePanel();
+    installBangumiQualityWatcher();
 
     const meta = readPageMeta();
     if (meta && meta.pageKey !== state.currentPageKey) {
@@ -292,6 +298,10 @@
         overflow: hidden;
         font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
       }
+      #${PANEL_ID}.position-right {
+        left: auto;
+        right: 16px;
+      }
       #${PANEL_ID} * {
         box-sizing: border-box;
       }
@@ -304,6 +314,10 @@
         border-bottom: 1px solid rgba(17, 24, 39, 0.08);
         background: rgba(255, 255, 255, 0.52);
       }
+      #${PANEL_ID} .bar > div:first-child {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
       #${PANEL_ID} .title {
         font-size: 15px;
         font-weight: 700;
@@ -312,11 +326,16 @@
       }
       #${PANEL_ID} .status {
         margin-top: 4px;
+        max-width: min(320px, calc(100vw - 96px));
         font-size: 12px;
         color: rgba(17, 24, 39, 0.66);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       #${PANEL_ID} .controls {
         display: flex;
+        flex: 0 0 auto;
         gap: 8px;
         flex-wrap: wrap;
       }
@@ -495,11 +514,23 @@
         -webkit-backdrop-filter: blur(18px) saturate(1.18);
       }
       #${PANEL_ID}.collapsed .bar {
+        gap: 0;
+        padding: 8px;
         background: rgba(255, 255, 255, 0.52);
         border-bottom-color: rgba(17, 24, 39, 0.08);
       }
       #${PANEL_ID}.collapsed .title {
-        color: #111827;
+        display: block;
+        font-size: 13px;
+      }
+      #${PANEL_ID}.collapsed .position-button {
+        display: none;
+      }
+      #${PANEL_ID}.collapsed .controls button[data-action="toggle"] {
+        min-width: 32px;
+        padding: 7px 8px;
+        font-size: 16px;
+        line-height: 1;
       }
       #${PANEL_ID} .controls button.secondary[data-action="toggle"] {
         background: #F48FAC;
@@ -532,6 +563,8 @@
           <div class="status" data-role="status">正在初始化...</div>
         </div>
         <div class="controls">
+          <button class="secondary position-button" data-action="position-left">左下</button>
+          <button class="secondary position-button" data-action="position-right">右下</button>
           <button class="secondary" data-action="toggle">展开</button>
         </div>
       </div>
@@ -564,17 +597,32 @@
     const applyCollapsedState = collapsed => {
       panel.classList.toggle('collapsed', collapsed);
       if (toggleButton) {
-        toggleButton.textContent = collapsed ? '展开' : '收起';
+        toggleButton.textContent = collapsed ? '⤢' : '收起';
+        toggleButton.title = collapsed ? '展开 BiliDrown' : '收起 BiliDrown';
+        toggleButton.setAttribute('aria-label', toggleButton.title);
       }
       try {
         localStorage.setItem(PANEL_COLLAPSED_STORAGE_KEY, collapsed ? '1' : '0');
       } catch (_) { }
     };
 
+    const applyPosition = position => {
+      const isRight = position === 'right';
+      panel.classList.toggle('position-right', isRight);
+      panel.querySelector('[data-action="position-left"]')?.classList.toggle('primary', !isRight);
+      panel.querySelector('[data-action="position-right"]')?.classList.toggle('primary', isRight);
+      try {
+        localStorage.setItem(PANEL_POSITION_STORAGE_KEY, isRight ? 'right' : 'left');
+      } catch (_) { }
+    };
+
     applyCollapsedState(readCollapsedState());
+    applyPosition(readPanelPosition());
     toggleButton?.addEventListener('click', () => {
       applyCollapsedState(!panel.classList.contains('collapsed'));
     });
+    panel.querySelector('[data-action="position-left"]')?.addEventListener('click', () => applyPosition('left'));
+    panel.querySelector('[data-action="position-right"]')?.addEventListener('click', () => applyPosition('right'));
 
     panel.querySelector('[data-action="toggle-logs"]')?.addEventListener('click', () => {
       panel.classList.toggle('logs-open');
@@ -625,6 +673,14 @@
       return localStorage.getItem(PANEL_COLLAPSED_STORAGE_KEY) === '1';
     } catch (_) {
       return false;
+    }
+  }
+
+  function readPanelPosition() {
+    try {
+      return localStorage.getItem(PANEL_POSITION_STORAGE_KEY) === 'right' ? 'right' : 'left';
+    } catch (_) {
+      return 'left';
     }
   }
 
@@ -695,6 +751,7 @@
   function hydratePayloadFromPageGlobals() {
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
     const candidates = [
+      pageWindow.__PLAYURL_HYDRATE_DATA__,
       pageWindow.__playinfo__,
       pageWindow.__playInfo__,
       pageWindow.__INITIAL_STATE__?.playinfo,
@@ -716,6 +773,7 @@
       }
       const normalized = normalizePayload(payload, location.href);
       if (normalized.dash || normalized.durl) {
+        normalized.title = getCrxCompatibleDownloadTitle(normalized.title);
         console.log('[B站下载助手] 从页面全局数据中恢复 playurl:', normalized.query);
         if (state.currentPageKey && normalized.pageKey !== state.currentPageKey) {
           continue;
@@ -812,6 +870,129 @@
     return `${title}_P${currentPage.page}_${currentPage.part}`;
   }
 
+  function getCrxCompatibleBangumiTitle(fallbackTitle) {
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const hydrateData = pageWindow.__PLAYURL_HYDRATE_DATA__ || {};
+    const hydrateEpisode = hydrateData?.result?.supplement?.ogv_episode_info;
+    if (hydrateEpisode) {
+      const pageTitle = (document.title || '').split('-')[0] || fallbackTitle;
+      return `${pageTitle}_${hydrateEpisode.index_title || ''}_${hydrateEpisode.long_title || ''}`;
+    }
+
+    const initialState = pageWindow.__INITIAL_STATE__ || {};
+    const seasonInfo = initialState.seasonInfo || initialState?.mediaInfo?.seasonInfo || {};
+    const episodes = seasonInfo?.mediaInfo?.episodes || initialState?.episodes || [];
+    const episodeId = getCurrentPageIdentity().ep_id;
+    const episode = episodes.find(item => String(item?.ep_id) === String(episodeId));
+    const seasonTitle = seasonInfo?.mediaInfo?.title || initialState?.mediaInfo?.title;
+    if (episode && seasonTitle) {
+      return `${seasonTitle}_${episode.titleFormat || episode.title || ''}_${episode.long_title || ''}`;
+    }
+    return fallbackTitle;
+  }
+
+  function getCrxCompatibleDownloadTitle(fallbackTitle) {
+    if (/\/bangumi\/play\//i.test(location.pathname)) {
+      return getCrxCompatibleBangumiTitle(fallbackTitle);
+    }
+    return getCrxCompatibleVideoTitle(fallbackTitle);
+  }
+
+  function getPayloadFromPageGlobals(expectedQuality = null) {
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const candidates = [
+      pageWindow.__PLAYURL_HYDRATE_DATA__,
+      pageWindow.__playinfo__,
+      pageWindow.__playInfo__,
+      pageWindow.__INITIAL_STATE__?.playinfo,
+      pageWindow.__INITIAL_STATE__?.playInfo,
+      pageWindow.__INITIAL_STATE__?.videoData?.playinfo,
+    ];
+
+    for (const candidate of candidates) {
+      if (!candidate) {
+        continue;
+      }
+      let payload = candidate;
+      if (typeof candidate === 'string') {
+        try {
+          payload = JSON.parse(candidate);
+        } catch (_) {
+          continue;
+        }
+      }
+      const normalized = normalizePayload(payload, location.href, state.currentPageKey || readPageMeta().pageKey);
+      if (!normalized.dash && !normalized.durl) {
+        continue;
+      }
+      if (expectedQuality && normalized.quality && normalized.quality !== expectedQuality) {
+        continue;
+      }
+      normalized.title = getCrxCompatibleDownloadTitle(normalized.title);
+      return normalized;
+    }
+    return null;
+  }
+
+  function applyPayloadFromPageGlobals(expectedQuality = null) {
+    const payload = getPayloadFromPageGlobals(expectedQuality);
+    if (!payload) {
+      return false;
+    }
+    state.currentPayloadKey = payload.pageKey;
+    state.currentPayload = payload;
+    renderPayload(payload, state.currentMeta || readPageMeta());
+    return true;
+  }
+
+  function installBangumiQualityWatcher() {
+    if (!/\/bangumi\/play\//i.test(location.pathname)) {
+      state.bangumiQualityObserver?.disconnect();
+      state.bangumiQualityObserver = null;
+      state.bangumiQualityTarget = null;
+      return;
+    }
+
+    const target = document.querySelector('.bpx-player-ctrl-quality-result');
+    if (!target) {
+      window.clearTimeout(state.bangumiQualityRetryTimer);
+      state.bangumiQualityRetryTimer = window.setTimeout(installBangumiQualityWatcher, 300);
+      return;
+    }
+    if (target === state.bangumiQualityTarget) {
+      return;
+    }
+
+    state.bangumiQualityObserver?.disconnect();
+    state.bangumiQualityTarget = target;
+    state.bangumiQualityObserver = new MutationObserver(() => {
+      const expectedQuality = getPlayerSelectedQuality();
+      setStatus('正在更新当前清晰度的下载资源...');
+      window.clearTimeout(state.bangumiQualityRefreshTimer);
+      state.bangumiQualityRefreshTimer = window.setTimeout(() => {
+        applyPayloadFromPageGlobals(expectedQuality);
+        scheduleScan();
+      }, 250);
+    });
+    state.bangumiQualityObserver.observe(target, { childList: true, subtree: true, characterData: true });
+  }
+
+  async function refreshBangumiPayloadForDownload(fallbackPayload) {
+    const expectedQuality = getPlayerSelectedQuality();
+    for (let attempt = 0; attempt < 8; attempt++) {
+      if (applyPayloadFromPageGlobals(expectedQuality)) {
+        return state.currentPayload;
+      }
+      if (state.currentPayload?.quality === expectedQuality) {
+        state.currentPayload.title = getCrxCompatibleDownloadTitle(state.currentPayload.title);
+        return state.currentPayload;
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 200));
+    }
+    console.warn('[B站下载助手] 未能在当前清晰度找到新的番剧 playurl，使用已解析的资源。');
+    return fallbackPayload;
+  }
+
   async function refreshVideoPayloadForDownload(fallbackPayload) {
     const identity = getCurrentPageIdentity();
     if (identity.type !== 'video' || !identity.cid || (!identity.avid && !identity.bvid)) {
@@ -845,7 +1026,7 @@
       if (!refreshedPayload.dash && !refreshedPayload.durl) {
         throw new Error('playurl 响应中没有可下载的媒体流');
       }
-      refreshedPayload.title = getCrxCompatibleVideoTitle(refreshedPayload.title);
+      refreshedPayload.title = getCrxCompatibleDownloadTitle(refreshedPayload.title);
       state.currentPayloadKey = refreshedPayload.pageKey;
       state.currentPayload = refreshedPayload;
       return refreshedPayload;
@@ -912,7 +1093,7 @@
     return {
       code: payload?.code ?? data?.code ?? 0,
       message: payload?.message ?? data?.message ?? '',
-      title: state.currentMeta?.title || cleanTitle(document.title || 'B站视频'),
+      title: getCrxCompatibleDownloadTitle(state.currentMeta?.title || cleanTitle(document.title || 'B站视频')),
       pageType: /\/bangumi\/play\//i.test(location.pathname) ? '番剧/影视' : '投稿视频',
       pageKey,
       quality,
@@ -1143,7 +1324,7 @@
     const coverBytes = await fetchBinary(coverUrl, progress => {
       if (taskId === state.activeTaskId) {
         const percent = progress.total > 0 ? Math.round((progress.received / progress.total) * 100) : 0;
-        setStatus(`封面下载中：${progress.received}/${progress.total > 0 ? progress.total : '?'} ${progress.total > 0 ? `${percent}%` : ''}`.trim());
+        setStatus(`封面下载中：${progress.total > 0 ? `${percent}%` : '计算中...'}`);
       }
     });
 
@@ -1545,11 +1726,13 @@
       return;
     }
 
-    // 投稿视频与原 CRX 一样，在下载前按播放器当前清晰度重新请求 playurl；
-    // 番剧继续沿用播放器的已授权响应，避免越过其不同的播放授权路径。
+    // 投稿与番剧均在下载前确认播放器当前清晰度对应的 playurl；
+    // 番剧只复用播放器已授权的数据，不主动调用不同的授权接口。
     if (action !== 'download-cover') {
       setStatus('正在确认当前清晰度的下载资源...');
-      payload = await refreshVideoPayloadForDownload(payload);
+      payload = getCurrentPageIdentity().type === 'bangumi'
+        ? await refreshBangumiPayloadForDownload(payload)
+        : await refreshVideoPayloadForDownload(payload);
     }
 
     const taskId = ++state.activeTaskId;
@@ -1561,8 +1744,13 @@
     try {
       // 根据 action 确定下载类型
       if (action === 'download-video') {
-        // 只下载视频
-        await downloadVideoOnly(payload, taskId);
+        if (payload.dash?.video) {
+          await downloadVideoOnly(payload, taskId);
+        } else if (payload.durl?.length) {
+          await downloadAllDurlSegments(payload, taskId);
+        } else {
+          throw new Error('当前资源没有可下载的视频流');
+        }
       } else if (action === 'download-audio') {
         // 只下载音频
         await downloadAudioOnly(payload, taskId);
@@ -1725,13 +1913,38 @@
     setStatus(`✓ 已下载：${videoFilename} 和 ${audioFilename}`);
   }
 
+  async function downloadAllDurlSegments(payload, taskId) {
+    const segments = payload.durl || [];
+    if (segments.length === 0) {
+      throw new Error('当前资源没有可下载的视频分段');
+    }
+
+    const baseName = safeName(payload.title);
+    const filenames = [];
+    for (let index = 0; index < segments.length; index++) {
+      if (taskId !== state.activeTaskId) {
+        throw new Error('下载已取消');
+      }
+      const segment = segments[index];
+      const candidates = getStreamCandidates(segment);
+      const label = segments.length > 1 ? `视频分段 ${index + 1}/${segments.length}` : '视频流';
+      setStatus(`正在下载${label}...`);
+      const [bytes, url] = await downloadBinaryWithFallback(candidates, label, taskId);
+      if (taskId !== state.activeTaskId) {
+        return;
+      }
+
+      const extension = getMediaExtension(url).replace(/\.m4s$/i, '.mp4');
+      const filename = `${baseName}${segments.length > 1 ? `_分段${index + 1}` : ''}${extension}`;
+      setStatus(`正在保存${label}: ${filename}`);
+      await saveBlob(new Blob([bytes], { type: 'video/mp4' }), filename);
+      filenames.push(filename);
+    }
+    setStatus(`✓ 已下载 ${filenames.length} 个视频分段`);
+  }
+
   async function downloadSingleStream(payload, taskId) {
-    const segment = payload.durl[0];
-    const candidates = getStreamCandidates(segment);
-    const [bytes, url] = await downloadBinaryWithFallback(candidates, '视频流', taskId);
-    const filename = `${safeName(payload.title)}${getMediaExtension(url)}`;
-    await saveBlob(new Blob([bytes], { type: 'application/octet-stream' }), filename);
-    setStatus(`已生成 ${filename}`);
+    await downloadAllDurlSegments(payload, taskId);
   }
 
   async function downloadBinaryWithFallback(urls, label, taskId) {
@@ -1751,7 +1964,7 @@
         const bytes = await fetchBinary(url, progress => {
           if (taskId === state.activeTaskId) {
             const percent = progress.total > 0 ? Math.round((progress.received / progress.total) * 100) : 0;
-            setStatus(`${label}下载中：${progress.received}/${progress.total > 0 ? progress.total : '?'} ${progress.total > 0 ? `${percent}%` : ''}`.trim());
+            setStatus(`${label}下载中：${progress.total > 0 ? `${percent}%` : '计算中...'}`);
           }
         });
         console.log(`[B站下载助手] ${label} 下载成功，字节数:`, bytes?.byteLength);
